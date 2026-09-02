@@ -1,0 +1,32 @@
+name: millerobd_serializer
+description: >
+  Bench tool for programming MillerOBD M1 (V015) adapters with a signed
+  per-unit identity. One device at a time: connect, identify, program, verify,
+  record.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+  flutter: ">=3.29.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # The BLE stack. universal_ble and not flutter_blue_plus for the same reason
+  # drivedecode-app switched: flutter_blue_plus has no Windows implementation
+  # at all, and the bench runs on Windows as often as macOS.
+  universal_ble: ^2.1.1
+  window_manager: ^0.4.2
+  http: ^1.2.2
+  shared_preferences: ^2.3.2
+  path_provider: ^2.1.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  crypto: ^3.0.7
+
+flutter:
+  uses-material-design: true
