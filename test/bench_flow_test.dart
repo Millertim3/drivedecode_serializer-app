@@ -30,20 +30,46 @@ import 'identity_test.dart' show vectorSerial, vectorTag;
 const _adapter = DiscoveredAdapter(id: 'BF7DE026', name: 'OBD BLE', rssi: -50);
 
 /// A controller wired to a fake adapter and a fake server.
-({BenchController controller, FakeTransport transport, FakeServer server})
-    harness(FakeAdapter adapter, {FakeServer? server}) {
-  final s = server ?? FakeServer();
-  final transport = FakeTransport(adapter, adapters: const [_adapter]);
-  final controller = BenchController(
-    transport: transport,
-    client: BenchClient(
-      baseUrl: 'https://bench.test',
-      adminToken: 'token',
-      client: MockClient(s.handle),
-    ),
-  );
-  return (controller: controller, transport: transport, server: s);
+///
+/// [transports] records every transport the controller builds, in order. The
+/// ADAPTER is shared across all of them and the TRANSPORT is new each time,
+/// which is the real relationship: the hardware on the bench persists, the
+/// object talking to it does not.
+class Harness {
+  Harness(this.adapter, {FakeServer? server}) : server = server ?? FakeServer() {
+    controller = BenchController(
+      transportFactory: () {
+        final t = FakeTransport(adapter, adapters: const [_adapter]);
+        transports.add(t);
+        return t;
+      },
+      client: BenchClient(
+        baseUrl: 'https://bench.test',
+        adminToken: 'token',
+        client: MockClient(this.server.handle),
+      ),
+    );
+  }
+
+  final FakeAdapter adapter;
+  final FakeServer server;
+  late final BenchController controller;
+  final List<FakeTransport> transports = [];
+
+  /// The transport the controller is using now.
+  FakeTransport get transport => transports.last;
+
+  /// Get to a connected adapter the way the operator does — the controller
+  /// builds its first transport inside startScan, so nothing can connect
+  /// before one has run.
+  Future<void> connect() async {
+    await controller.startScan();
+    await controller.connect(_adapter);
+  }
 }
+
+Harness harness(FakeAdapter adapter, {FakeServer? server}) =>
+    Harness(adapter, server: server);
 
 void main() {
   group('the Go — a model that cannot carry an identity', () {
@@ -51,7 +77,7 @@ void main() {
       final go = FakeAdapter.go();
       final h = harness(go);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
 
       expect(h.controller.state, isA<NotProgrammable>());
       final state = h.controller.state as NotProgrammable;
@@ -108,7 +134,7 @@ void main() {
       final m1 = FakeAdapter.m1();
       final h = harness(m1);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
       expect(h.controller.state, isA<ReadyToProgram>());
 
       await h.controller.program();
@@ -142,14 +168,14 @@ void main() {
     test('never sends ATMAC', () async {
       final m1 = FakeAdapter.m1();
       final h = harness(m1);
-      await h.controller.connect(_adapter);
+      await h.connect();
       await h.controller.program();
       expect(m1.received, isNot(contains('ATMAC')));
     });
 
     test('records the fingerprint evidence with the allocation', () async {
       final h = harness(FakeAdapter.m1());
-      await h.controller.connect(_adapter);
+      await h.connect();
       await h.controller.program();
 
       final fp = h.server.allocations.single['fingerprint'] as Map;
@@ -166,7 +192,7 @@ void main() {
       _preprogram(m1, serial: vectorSerial, tagHex: vectorTag);
       final h = harness(m1, server: server);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
 
       expect(h.controller.state, isA<AlreadyProgrammed>());
       final state = h.controller.state as AlreadyProgrammed;
@@ -181,7 +207,7 @@ void main() {
       _preprogram(m1, serial: 4242, tagHex: vectorTag);
       final h = harness(m1); // server knows nothing
 
-      await h.controller.connect(_adapter);
+      await h.connect();
 
       expect(h.controller.state, isA<UnknownSerial>());
       expect((h.controller.state as UnknownSerial).read.identity.serial, 4242);
@@ -195,7 +221,7 @@ void main() {
       _preprogram(m1, serial: 4242, tagHex: vectorTag);
       final h = harness(m1);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
       await h.controller.program(wipeFirst: true);
 
       expect(h.controller.state, isA<Success>(),
@@ -213,7 +239,7 @@ void main() {
       m1.pp['1C'] = '92';
       final h = harness(m1);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
       expect(h.controller.state, isA<PartiallyProgrammed>());
     });
   });
@@ -225,7 +251,7 @@ void main() {
       final m1 = FakeAdapter.m1()..rejectSlots.add('1D');
       final h = harness(m1);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
       await h.controller.program();
 
       final state = h.controller.state;
@@ -243,7 +269,7 @@ void main() {
 
     test('retires the serial on abort, and never recycles it', () async {
       final h = harness(FakeAdapter.m1()..rejectSlots.add('1D'));
-      await h.controller.connect(_adapter);
+      await h.connect();
       await h.controller.program();
       await h.controller.abort();
 
@@ -254,7 +280,7 @@ void main() {
     test('reuses the same serial on retry rather than burning another', () async {
       final m1 = FakeAdapter.m1()..rejectSlots.add('1D');
       final h = harness(m1);
-      await h.controller.connect(_adapter);
+      await h.connect();
       await h.controller.program();
 
       // The slot starts cooperating — an interrupted write, then a good one.
@@ -275,7 +301,7 @@ void main() {
       final m1 = FakeAdapter.m1();
       final h = harness(m1, server: FakeServer()..offline = true);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
       await h.controller.program();
 
       expect(h.controller.state, isA<Failed>());
@@ -295,7 +321,7 @@ void main() {
       final m1 = FakeAdapter.m1();
       final h = harness(m1, server: FakeServer()..failConfirm = true);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
       await h.controller.program();
 
       expect(h.controller.state, isA<Success>(),
@@ -309,7 +335,7 @@ void main() {
       final m1 = _MuteAfterWrite();
       final h = harness(m1);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
       await h.controller.program();
 
       final state = h.controller.state;
@@ -327,7 +353,7 @@ void main() {
       m1.enabled.addAll(kAllSlots);
       final h = harness(m1);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
       expect(h.controller.state, isA<NeedsRepair>());
 
       await h.controller.repair();
@@ -381,10 +407,206 @@ void main() {
       );
       final h = harness(other);
 
-      await h.controller.connect(_adapter);
+      await h.connect();
       expect(h.controller.state, isA<NotProgrammable>());
       expect((h.controller.state as NotProgrammable).reason,
           contains('not one of ours'));
+    });
+  });
+
+  // =====================================================================
+  // Letting go of the adapter
+  //
+  // Every control that ends a unit rebuilds the BLE transport rather than
+  // merely disconnecting it. The reason is universal_ble's process-global
+  // command queue: it has no timeout of its own, so one native call that never
+  // answers starves every later BLE command for the life of the process. A
+  // soft rescan inherits that state; a new transport does not. On a bench that
+  // is the difference between a hundred-unit run and restarting the app
+  // between units.
+  // =====================================================================
+  group('Next Device rebuilds the transport', () {
+    test('disposes the old transport and scans on a new one', () async {
+      final h = harness(FakeAdapter.m1());
+      await h.connect();
+      final first = h.transport;
+      expect(first.connected, isTrue);
+
+      await h.controller.nextDevice();
+
+      expect(h.transports, hasLength(2), reason: 'a fresh instance was built');
+      expect(first.disposed, isTrue, reason: 'the old one was retired');
+      expect(identical(h.transport, first), isFalse);
+      expect(h.controller.state, isA<Scanning>());
+    });
+
+    /// Retiring first is what lets the outgoing instance see that it has been
+    /// replaced — the generation check in UniversalBleTransport is what
+    /// actually keeps it off the radio, and it can only work if the successor
+    /// exists by the time the old teardown reaches it.
+    ///
+    /// The radio handover itself is pinned against a fake BLE platform in
+    /// radio_handover_test.dart; this only pins the order the controller does
+    /// the two things in.
+    test('retires the old transport before the new one scans', () async {
+      final order = <String>[];
+      final adapter = FakeAdapter.m1();
+      var index = 0;
+      final controller = BenchController(
+        transportFactory: () => _OrderedTransport(adapter, order, index++),
+        client: BenchClient(
+          baseUrl: 'https://bench.test',
+          adminToken: 'token',
+          client: MockClient(FakeServer().handle),
+        ),
+      );
+
+      await controller.startScan();
+      order.clear();
+      await controller.nextDevice();
+
+      expect(order, contains('dispose#0'));
+      expect(order, contains('scan#1'));
+      expect(order.indexOf('dispose#0'), lessThan(order.indexOf('scan#1')));
+    });
+
+    /// The whole point of not awaiting the teardown. A wedged native queue is
+    /// exactly the state the operator presses this button in, and a button
+    /// that waits for it is a button that does nothing visible at all.
+    test('is not blocked by a teardown that never finishes', () async {
+      final h = harness(FakeAdapter.m1());
+      await h.connect();
+      h.transport.hangDispose = true;
+
+      await h.controller.nextDevice().timeout(const Duration(seconds: 2));
+
+      expect(h.controller.state, isA<Scanning>());
+      expect(h.transports, hasLength(2));
+    });
+
+    /// A transport being disposed because something already went wrong is
+    /// entitled to fail on the way out. There is no caller left to tell.
+    test('survives a teardown that throws', () async {
+      final h = harness(FakeAdapter.m1());
+      await h.connect();
+      h.transport.disposeError = StateError('native stack is gone');
+
+      await h.controller.nextDevice();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(h.controller.state, isA<Scanning>());
+      expect(h.controller.log.join('\n'), contains('teardown failed'));
+    });
+
+    /// One recovery, reached from every direction. A second version of this
+    /// would be the one nobody was testing.
+    test('every control that lets go of the adapter runs the same reset',
+        () async {
+      for (final act in <Future<void> Function(Harness)>[
+        (h) => h.controller.nextDevice(),
+        (h) => h.controller.abort(),
+        (h) => h.controller.startScan(),
+      ]) {
+        final h = harness(FakeAdapter.m1());
+        await h.connect();
+        final before = h.transport;
+
+        await act(h);
+
+        expect(before.disposed, isTrue);
+        expect(h.transports, hasLength(2));
+      }
+    });
+
+    /// The failure path retires the serial AND the transport. Aborting after a
+    /// bad unit is the case where the stack is most likely to be wedged.
+    test('abort rebuilds the transport as well as retiring the serial',
+        () async {
+      final h = harness(FakeAdapter.m1()..rejectSlots.add('1D'));
+      await h.connect();
+      await h.controller.program();
+      final before = h.transport;
+
+      await h.controller.abort();
+
+      expect(h.server.failures, [1001]);
+      expect(before.disposed, isTrue);
+      expect(h.transports, hasLength(2));
+    });
+
+    /// Back-to-back units over fresh transports, which is what a production
+    /// run actually is.
+    test('programs two units in a row over separate transports', () async {
+      final h = harness(FakeAdapter.m1());
+
+      await h.connect();
+      await h.controller.program();
+      expect((h.controller.state as Success).allocation.serial, 1001);
+
+      await h.controller.nextDevice();
+      // A blank adapter on the bench again — the next physical unit.
+      h.adapter.pp.updateAll((_, __) => 'FF');
+      h.adapter.userByte = 'FF';
+
+      await h.controller.connect(_adapter);
+      await h.controller.program();
+
+      expect(h.controller.state, isA<Success>(),
+          reason: _describe(h.controller.state));
+      expect((h.controller.state as Success).allocation.serial, 1002);
+      expect(h.controller.sessionCount, 2);
+      expect(h.transports, hasLength(2));
+      expect(h.transports.first.disposed, isTrue);
+    });
+
+
+    /// Long operations take seconds and the operator is entitled to give up in
+    /// the middle of one. Dart futures do not cancel, so the abandoned work
+    /// runs to completion anyway — and before the flow stamp it wrote its
+    /// result over the screen the operator was now looking at, which is
+    /// exactly "I pressed Disconnect and it did nothing".
+    test('a Disconnect pressed mid-program is not undone by the work in flight',
+        () async {
+      final m1 = FakeAdapter.m1();
+      final h = harness(m1, server: FakeServer()..allocateDelay =
+          const Duration(milliseconds: 80));
+      await h.connect();
+
+      final programming = h.controller.program();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      // The operator gives up while the serial is still being allocated.
+      await h.controller.nextDevice();
+      expect(h.controller.state, isA<Scanning>());
+
+      await programming;
+
+      expect(h.controller.state, isA<Scanning>(),
+          reason: 'abandoned work wrote over the operator\'s screen');
+    });
+
+    /// The same, one step earlier: giving up while the adapter is still being
+    /// identified.
+    test('a Disconnect pressed mid-identify is not undone either', () async {
+      final h = harness(FakeAdapter.m1());
+      await h.controller.startScan();
+
+      final connecting = h.controller.connect(_adapter);
+      await h.controller.nextDevice();
+
+      await connecting;
+
+      expect(h.controller.state, isA<Scanning>());
+    });
+
+    /// Nothing can connect before a transport exists, and the controller must
+    /// say so rather than dereferencing null.
+    test('refuses to connect before the first scan has built a transport',
+        () async {
+      final h = harness(FakeAdapter.m1());
+      await h.controller.connect(_adapter);
+      expect(h.controller.state, isA<Failed>());
+      expect(h.transports, isEmpty);
     });
   });
 }
@@ -426,3 +648,26 @@ class _MuteAfterWrite extends FakeAdapter {
 
 String _describe(BenchState s) =>
     s is Failed ? 'unexpectedly Failed: ${s.message} — ${s.detail}' : '$s';
+
+
+/// A transport that records when it is scanned and when it is disposed, so a
+/// test can assert the ORDER of the two across an instance swap.
+class _OrderedTransport extends FakeTransport {
+  _OrderedTransport(super.adapter, this._order, this._index)
+      : super(adapters: const [_adapter]);
+
+  final List<String> _order;
+  final int _index;
+
+  @override
+  Stream<List<DiscoveredAdapter>> scan({required String deviceName}) {
+    _order.add('scan#$_index');
+    return super.scan(deviceName: deviceName);
+  }
+
+  @override
+  Future<void> dispose() {
+    _order.add('dispose#$_index');
+    return super.dispose();
+  }
+}

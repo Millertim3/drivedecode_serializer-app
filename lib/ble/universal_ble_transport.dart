@@ -50,7 +50,49 @@ class UartLayout {
 }
 
 class UniversalBleTransport implements BleTransport {
-  UniversalBleTransport();
+  UniversalBleTransport() : _generation = ++_generations;
+
+  /// How many transports this process has built, and which one this is.
+  ///
+  /// THE RADIO IS PROCESS-GLOBAL AND SO IS `stopScan`. [_alive] settles
+  /// ownership between an instance and its own teardown; this settles it
+  /// between an instance and its SUCCESSOR, which is a different question and
+  /// the one that was getting answered wrong.
+  ///
+  /// The failure it fixes, in order of events, every time a bench operator
+  /// pressed Next Device while connected:
+  ///
+  ///   1. The outgoing transport is retired. Its dispose() awaits
+  ///      disconnect() first.
+  ///   2. `UniversalBle.disconnect` does not return when the platform call
+  ///      returns — it then waits for a connection EVENT, with a default
+  ///      timeout of SIXTY SECONDS. So that await outlives the button press by
+  ///      a wide margin.
+  ///   3. Meanwhile the replacement transport starts its scan: stopScan, then
+  ///      startScan. The radio is now scanning and belongs to the new
+  ///      instance.
+  ///   4. The disconnect event finally arrives, the old dispose() resumes, and
+  ///      it issues its own final `stopScan` — which is global, and which
+  ///      stops the scan that its successor started three seconds ago.
+  ///
+  /// The new scan's subscription stays alive and its pump keeps ticking, so
+  /// nothing reports an error; the picker just never shows anything again.
+  /// That is "Disconnect does not disconnect and Next Device does nothing".
+  ///
+  /// The app hits this rarely because its Rescan is usually pressed when
+  /// nothing is connected, and a disconnect with no device returns instantly.
+  /// A programming bench hits it on EVERY unit, because the whole point of the
+  /// button is to let go of a live link.
+  ///
+  /// So a dying transport stops the radio only while it is still the newest
+  /// one. If it has been replaced, the replacement owns the radio — and
+  /// already calls stopScan itself before every startScan, so nothing is
+  /// leaked by staying out of the way.
+  static int _generations = 0;
+  final int _generation;
+
+  /// Whether no successor has been built since this instance.
+  bool get _ownsRadio => _generation == _generations;
 
   /// Diagnostic hook for GATT discovery and characteristic selection. Feeds
   /// the bench log panel, where an operator watching a unit misbehave can see
@@ -345,10 +387,15 @@ class UniversalBleTransport implements BleTransport {
       await adverts?.cancel();
       adverts = null;
       onTrace?.call('scan: stopped (${seen.length} seen)');
-      // A disposed transport must not touch the radio: stopScan is
-      // process-global, so a late teardown here would kill a scan a NEWER
-      // instance had already started. See [_alive].
-      if (_alive) await _stopScanQuietly();
+      // A disposed or superseded transport must not touch the radio: stopScan
+      // is process-global, so a late teardown here would kill a scan a NEWER
+      // instance had already started. See [_alive] and [_ownsRadio].
+      if (_alive && _ownsRadio) {
+        await _stopScanQuietly();
+      } else {
+        onTrace?.call('scan: teardown left the radio alone — '
+            'transport #$_generation has been replaced');
+      }
     }
 
     Future<void> start() async {
@@ -869,21 +916,51 @@ class UniversalBleTransport implements BleTransport {
     } catch (_) {
       // Best-effort. We are going away either way.
     }
-    // Deliberately after `_alive = false`, and NOT through
-    // _stopScanQuietly: nothing awaits this, so a stopScan that never answers
-    // can only leak a future rather than block anything — and it must not arm
-    // a Timer, because a Timer created here during a widget test's teardown is
-    // still pending when the binding checks and fails the test for a reason
-    // unrelated to what it was testing.
-    unawaited(UniversalBle.stopScan().catchError((Object _) {}));
+    // The one stopScan a dying transport may make — and ONLY while it is
+    // still the newest one. A replaced instance reaching this line would stop
+    // a scan its successor had already started, which is the whole failure
+    // documented on [_generation]. The successor calls stopScan itself before
+    // every startScan, so skipping it here leaks nothing.
+    //
+    // Deliberately NOT through _stopScanQuietly: nothing awaits this, so a
+    // stopScan that never answers can only leak a future rather than block
+    // anything — and it must not arm a Timer, because a Timer created here
+    // during a widget test's teardown is still pending when the binding checks
+    // and fails the test for a reason unrelated to what it was testing.
+    if (_ownsRadio) {
+      unawaited(UniversalBle.stopScan().catchError((Object _) {}));
+    } else {
+      onTrace?.call('ble: transport #$_generation retired without touching '
+          'the radio — #$_generations owns it now');
+    }
     await _incoming.close();
   }
 
+  /// How long to wait for a disconnect to be confirmed.
+  ///
+  /// OURS, BECAUSE THE DEFAULT IS SIXTY SECONDS. `UniversalBle.disconnect`
+  /// issues the platform call and then waits for a connection EVENT to confirm
+  /// it, and that second wait defaults to a minute. On a bench that is a minute
+  /// in which the adapter is still connected — and a connected peripheral does
+  /// not advertise, so it is invisible to the very scan the operator is waiting
+  /// on.
+  ///
+  /// The platform call itself is fast; only the confirmation is slow when it is
+  /// slow at all. Timing out on the confirmation does not undo the disconnect —
+  /// it was already issued and queued — it just stops us waiting to be told.
+  static const _disconnectTimeout = Duration(seconds: 5);
+
   Future<void> _disconnectQuietly(BleDevice device) async {
+    final started = DateTime.now();
     try {
-      await device.disconnect();
-    } catch (_) {
-      // Already gone — nothing to do.
+      await device.disconnect(timeout: _disconnectTimeout);
+      final ms = DateTime.now().difference(started).inMilliseconds;
+      onTrace?.call('ble: disconnected ${device.deviceId} in ${ms}ms');
+    } catch (e) {
+      // Already gone, or the stack never confirmed it. Either way there is
+      // nothing left to do here and nobody to tell — but an operator watching
+      // an adapter that will not come back should be able to see which it was.
+      onTrace?.call('ble: disconnect of ${device.deviceId} did not confirm — $e');
     }
   }
 
@@ -921,12 +998,54 @@ class UniversalBleTransport implements BleTransport {
   /// [_linkUp] rather than an `await device.isConnected` seed, deliberately:
   /// an async platform round trip here opens a window in which the true state
   /// could change between the read and the subscription.
-  Stream<bool> _replaying(BleDevice device) async* {
-    yield _linkUp;
-    await for (final connected in device.connectionStream) {
-      _linkUp = connected;
-      yield connected;
-    }
+  ///
+  /// AN EXPLICIT CONTROLLER, NOT `async*`, AND THE REASON IS A REAL BUG.
+  ///
+  /// This was:
+  ///
+  ///     Stream<bool> _replaying(BleDevice device) async* {
+  ///       yield _linkUp;
+  ///       await for (final connected in device.connectionStream) {
+  ///         _linkUp = connected;
+  ///         yield connected;
+  ///       }
+  ///     }
+  ///
+  /// which reads correctly and cannot be cancelled. An `async*` generator only
+  /// observes cancellation at a `yield`, and that one spends its whole life
+  /// suspended at the `await for` waiting for the next connection event. On an
+  /// idle link no event is coming — so `cancel()` on a subscription to it
+  /// NEVER COMPLETES.
+  ///
+  /// The bench awaits exactly that cancel on its way to the next unit, so
+  /// Next Device and Disconnect hung before they reached the transport at all:
+  /// no teardown, no rebuild, no rescan, and no error either. Reported as "I
+  /// get to two devices in a session and then it stops" — two, because
+  /// swapping the adapter over physically produces a disconnect event, which
+  /// wakes the generator and lets that one cancel through by luck.
+  ///
+  /// With a controller, `onCancel` is called directly by the stream machinery
+  /// and cancelling the inner listener on a broadcast stream is immediate.
+  Stream<bool> _replaying(BleDevice device) {
+    StreamSubscription<bool>? inner;
+    late final StreamController<bool> out;
+    out = StreamController<bool>(
+      onListen: () {
+        out.add(_linkUp);
+        inner = device.connectionStream.listen(
+          (connected) {
+            _linkUp = connected;
+            if (!out.isClosed) out.add(connected);
+          },
+          onError: out.addError,
+        );
+      },
+      onCancel: () async {
+        await inner?.cancel();
+        inner = null;
+      },
+    );
+    return out.stream;
   }
 }
 

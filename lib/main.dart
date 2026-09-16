@@ -42,9 +42,12 @@ Future<void> main() async {
   );
 
   final settings = await BenchSettings.load();
-  final transport = UniversalBleTransport();
   final controller = BenchController(
-    transport: transport,
+    // A factory, not an instance: every Next Device / Disconnect throws the
+    // current transport away and builds a fresh one, which is the only
+    // recovery that survives a wedged universal_ble command queue. See
+    // BenchController.startScan.
+    transportFactory: UniversalBleTransport.new,
     client: BenchClient(
       baseUrl: settings.baseUrl,
       adminToken: settings.adminToken,

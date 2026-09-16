@@ -172,6 +172,15 @@ class FakeTransport implements BleTransport {
   /// Make the next write throw, for the dropped-link case.
   Object? failNextWrite;
 
+  /// Never finish dispose() — a wedged native BLE queue, which is exactly the
+  /// state the operator presses Next Device in. Nothing may await a transport
+  /// in this state.
+  bool hangDispose = false;
+
+  /// Make dispose() throw. A transport being torn down because something
+  /// already went wrong is entitled to fail on the way out.
+  Object? disposeError;
+
   @override
   GattLayout? get gatt => connected ? GattLayout(adapter.services) : null;
 
@@ -228,7 +237,14 @@ class FakeTransport implements BleTransport {
 
   @override
   Future<void> dispose() async {
+    // Set FIRST and synchronously, matching UniversalBleTransport: marking the
+    // instance dead is the part correctness depends on, and everything after
+    // it is cleanup nobody is waiting for.
     disposed = true;
+    if (hangDispose) return Completer<void>().future;
+    final error = disposeError;
+    if (error != null) throw error;
+    connected = false;
     await _incoming.close();
     await _link.close();
   }

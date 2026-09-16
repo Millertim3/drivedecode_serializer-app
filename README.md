@@ -19,7 +19,108 @@ Power an adapter up and it is found, connected, and identified. From there:
 | A **half-written** identity | Offers erase-and-reprogram with a fresh serial |
 | **Enabled** identity slots | Offers `AT PP FF OFF` to repair |
 
-Then **Next Device** — one click, disconnects and resumes scanning.
+Then **Next Device** — one click, and the Bluetooth transport is rebuilt from
+scratch before the next scan.
+
+## Why Next Device throws the transport away
+
+It does not simply disconnect and re-scan. It disposes the whole
+`BleTransport` and builds a new one, which is the same recovery
+`drivedecode-app` runs behind its Rescan button
+(`lib/providers/connection_reset.dart`).
+
+A soft disconnect can only recover state this app owns. It cannot recover the
+layer underneath: `universal_ble` serialises every BLE command through a
+*process-global* queue with no timeout of its own, so one native call that
+never answers starves every later command for the life of the process. That is
+the state behind drivedecode's field report — *"sits on Looking for your
+adapter even after pressing rescan; the only way to re-find the adapter is to
+close the app."* A bench that needs restarting between units is a bench nobody
+uses.
+
+Every control that lets go of the adapter runs the same reset: **Next Device**,
+the header's **Disconnect**, **Abort**, and the retry that starts over. One
+recovery, so there is no second version to drift.
+
+Three ordering rules, all load-bearing and all covered by tests:
+
+1. **Local state first, and it is the only thing awaited.** Cancelling
+   subscriptions and closing the ELM session is pure Dart and cannot block.
+2. **The old transport is retired before the new scan starts, and is never
+   awaited.** Not awaiting is the point — a wedged native queue is exactly the
+   state this button gets pressed in, and awaiting a call into it is how the
+   button comes to do nothing visible.
+3. **No soft `disconnect()` anywhere.** `dispose()` does that and harder — it
+   marks the instance dead synchronously, so a teardown still unwinding can
+   never touch the radio the new instance now owns.
+
+### The handover, and the bug it fixes
+
+Retiring the old transport is not enough on its own, because
+`UniversalBle.disconnect` does **not** return when the platform call returns.
+It then waits for a connection *event* to confirm the disconnect, with a
+default timeout of **sixty seconds**. So the outgoing transport's `dispose()`
+finishes whenever it finishes — routinely seconds after the replacement is
+already scanning — and its own final `stopScan` is process-global. It stopped
+the scan its successor had started.
+
+Nothing errored. The new scan's subscription was alive and its emit pump was
+ticking; the radio was simply off, so no advertisement could ever arrive. The
+adapter was also still connected for that whole window, and a connected
+peripheral does not advertise. That is "Disconnect is not disconnecting and
+Next Device does nothing", from both ends at once.
+
+Two fixes, both in `lib/ble/universal_ble_transport.dart`:
+
+- **A generation counter.** A dying transport stops the radio only while it is
+  still the newest one. Once replaced, the replacement owns the radio — and
+  calls `stopScan` itself before every `startScan`, so nothing leaks.
+- **A five-second disconnect timeout** instead of the library's sixty. The
+  platform call is fast; only the confirmation lags, and timing out on the
+  confirmation does not undo a disconnect that was already issued.
+
+`drivedecode-app` rarely hits this because its Rescan is usually pressed when
+nothing is connected, and a disconnect with no device returns instantly. A
+programming bench hits it on *every* unit, because letting go of a live link is
+the entire purpose of the button.
+
+A third fix, and the one that actually stopped runs dead: **`connectionState`
+is no longer an `async*` generator.** It was:
+
+```dart
+Stream<bool> _replaying(BleDevice device) async* {
+  yield _linkUp;
+  await for (final connected in device.connectionStream) { ... yield connected; }
+}
+```
+
+which reads correctly and cannot be cancelled. An `async*` only observes
+cancellation at a `yield`, and that one spends its life suspended at the
+`await for`. On an idle link no event is coming, so it never reaches a `yield`
+and `cancel()` **never completes**. The bench awaits exactly that cancel on its
+way to the next unit, so Next Device and Disconnect hung before reaching the
+transport at all — no teardown, no rebuild, no rescan, no error. Reported as
+*"I get to two devices in a session and then it stops"*: two, because
+physically swapping the adapter produces a disconnect event, which wakes the
+generator and lets that one cancel through by luck.
+
+It is a `StreamController` now, where `onCancel` is called directly by the
+stream machinery.
+
+Also: `startScan`'s own teardown is bounded (2s) so a future blocking step
+degrades the bench instead of killing it, and every state write from a long
+operation carries the unit it belongs to, so a Disconnect pressed midway
+through a connect or a program is not undone by work already in the air.
+
+`test/session_soak_test.dart` programs eight units back to back over the real
+stack and **times each handover**, because the bound above means a blocking
+teardown now costs two seconds a unit rather than failing — which an operator
+feels as "the bench got slow" and a naive test would not feel at all.
+
+`test/radio_handover_test.dart` drives the real transport against a fake BLE
+platform (`UniversalBle.setInstance`) and reproduces all of this — a fake
+`BleTransport` cannot, because what goes wrong is the one piece of state two
+transports share.
 
 ## The four rules this tool enforces
 

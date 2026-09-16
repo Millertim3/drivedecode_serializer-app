@@ -29,6 +29,10 @@ class FakeServer {
   /// failure costs something real.
   bool failConfirm = false;
 
+  /// Hold the allocation open, so a test can press a button while the bench
+  /// is mid-operation.
+  Duration allocateDelay = Duration.zero;
+
   int _next = 1001;
 
   /// The development signing key, matching dtc-lookup/test/devices.test.ts.
@@ -80,6 +84,7 @@ class FakeServer {
         if (body['model'] == 'go') {
           return _json({'error': 'model_not_programmable'}, 409);
         }
+        if (allocateDelay > Duration.zero) await Future<void>.delayed(allocateDelay);
         final serial = _next++;
         allocations.add(body);
         known[serial] = 'allocated';

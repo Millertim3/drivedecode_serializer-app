@@ -57,21 +57,65 @@ const String kDeviceNameNeedle = 'OBD';
 
 class BenchController extends ChangeNotifier {
   BenchController({
-    required BleTransport transport,
+    required BleTransport Function() transportFactory,
     required BenchClient client,
     RegistryJournal? journal,
-  })  : _transport = transport,
+  })  : _transportFactory = transportFactory,
         _client = client,
         _journal = journal {
     UniversalTrace.attach(_log);
   }
 
-  final BleTransport _transport;
+  /// Builds a transport. A FACTORY and not an instance, because every control
+  /// that lets go of the adapter throws the current one away — see
+  /// [startScan].
+  final BleTransport Function() _transportFactory;
+
+  /// How long the app's own teardown may take before the bench stops waiting
+  /// for it. Generous by two orders of magnitude: cancelling subscriptions and
+  /// closing a session is microseconds of work, so anything approaching this
+  /// is a bug, not slowness.
+  static const _localTeardownDeadline = Duration(seconds: 2);
+
   final BenchClient _client;
   final RegistryJournal? _journal;
 
+  /// The live transport. Null before the first scan, and a DIFFERENT object
+  /// after every one.
+  BleTransport? _transport;
+
+  /// The current transport, for callers that only run while a link exists.
+  BleTransport get _link {
+    final t = _transport;
+    if (t == null) {
+      throw StateError('no transport — startScan has not run');
+    }
+    return t;
+  }
+
   BenchState _state = const Scanning();
   BenchState get state => _state;
+
+  /// Which unit the bench is working on.
+  ///
+  /// Bumped by every [startScan], which is every control that lets go of the
+  /// adapter. A long operation — connecting, identifying, programming — takes
+  /// seconds, and the operator is entitled to give up in the middle of one.
+  /// When they do, the operation keeps running to completion anyway: Dart
+  /// futures do not cancel, and the awaits inside it are platform calls that
+  /// answer when they answer.
+  ///
+  /// Without this, that abandoned work writes its result over the screen the
+  /// operator is now looking at — the scan list flips back to "Identifying" or
+  /// to a failure from a unit they already put down, and the button they
+  /// pressed looks like it did nothing. Every state write from inside a long
+  /// operation is stamped with the flow it belongs to, and a stale one is
+  /// dropped.
+  ///
+  /// The same discipline as the generation bump in drivedecode's
+  /// resetTransport, for the same reason: an abandoned attempt must not be
+  /// able to emit a success or a failure after the fact.
+  int _flow = 0;
 
   /// The command and BLE log, newest last. Bounded: a bench left running all
   /// day would otherwise grow this without limit, and the useful window is the
@@ -113,15 +157,76 @@ class BenchController extends ChangeNotifier {
   // Scanning
   // ---------------------------------------------------------------------
 
-  /// Start looking for adapters. Safe to call repeatedly; an existing scan is
-  /// torn down first.
+  /// Throw the transport away, build a new one, and scan over that.
+  ///
+  /// THE BIG HAMMER, AND IT HAS TO BE. A soft disconnect plus a fresh scan can
+  /// only recover the state this app owns. It cannot recover the layer
+  /// underneath: universal_ble serialises every BLE command through a
+  /// process-global queue with no timeout of its own, so one native call that
+  /// never answers starves every later command for the LIFE OF THE PROCESS.
+  /// That is the state behind drivedecode's field report — "sits on Looking
+  /// for your adapter even after pressing rescan; the only way to re-find the
+  /// adapter is to close the app" — and rebuilding the transport is what makes
+  /// this button mean something in it. On a bench that matters more than it
+  /// does in the app: the operator's next move after any outcome, good or bad,
+  /// is this button, and a bench that needs restarting between units is a
+  /// bench nobody uses.
+  ///
+  /// Every path that lets go of the adapter comes through here — Next Device,
+  /// the header's Disconnect, Abort, and the retry that starts over. One
+  /// recovery, so there is no second version to drift.
+  ///
+  /// THREE ORDERING RULES, all load-bearing:
+  ///
+  ///   1. Local state goes first, and it is the only thing awaited. Cancelling
+  ///      subscriptions and closing the session is pure Dart and cannot block.
+  ///
+  ///   2. The old transport is retired BEFORE the new scan starts, and is
+  ///      NEVER awaited. Not awaiting is the point — a wedged native queue is
+  ///      exactly the state this button is pressed in, and awaiting a call
+  ///      into it is how the button comes to do nothing visible at all.
+  ///
+  ///      What protects the new scan from the old transport's dying stopScan
+  ///      is NOT this ordering. It cannot be: `UniversalBle.disconnect` keeps
+  ///      waiting for a connection event long after its queued command has
+  ///      returned, so the old teardown finishes whenever it finishes — often
+  ///      seconds after the new scan is already running. The guard is the
+  ///      generation check in UniversalBleTransport, which keeps a replaced
+  ///      instance away from a radio it no longer owns. See its [_generation].
+  ///
+  ///   3. No soft `disconnect()` anywhere. [BleTransport.dispose] does that
+  ///      and harder — it marks the instance dead first, so a teardown still
+  ///      unwinding can never touch the radio the new instance now owns.
   Future<void> startScan({String? error}) async {
-    await _teardownLink();
-    await _scanSub?.cancel();
-    _scanSub = null;
+    // Anything still in flight from the last unit belongs to a flow the
+    // operator has walked away from. It may still finish; it may not write
+    // state when it does.
+    _flow++;
+
+    // 1. Ours, and bounded. Everything in here is pure Dart and should take
+    //    microseconds — but "should" is what this button has been wrong about
+    //    twice now, and a teardown step that blocks makes it dead on arrival
+    //    rather than merely slow. If it ever exceeds this, the bench moves on
+    //    without it and the log says so.
+    try {
+      await _releaseLocalState().timeout(_localTeardownDeadline);
+    } on TimeoutException {
+      _log('teardown: local state did not release in '
+          '${_localTeardownDeadline.inMilliseconds}ms — continuing anyway');
+    }
+
+    // 2. Retire before rebuild, and never await the retirement.
+    final outgoing = _transport;
+    if (outgoing != null) {
+      _log('transport: retiring and rebuilding');
+      _retire(outgoing);
+    }
+    _transport = _transportFactory();
+
     _set(Scanning(error: error));
 
-    _scanSub = _transport.scan(deviceName: kDeviceNameNeedle).listen(
+    // 3. The scan runs on the new instance.
+    _scanSub = _link.scan(deviceName: kDeviceNameNeedle).listen(
       (adapters) {
         // Only while still scanning: a batch arriving after the operator has
         // already connected must not throw the screen back to the picker.
@@ -143,25 +248,34 @@ class BenchController extends ChangeNotifier {
   Future<void> connect(DiscoveredAdapter adapter) async {
     if (_busy) return;
     _busy = true;
+    // Stamp every state write below with the unit this call belongs to, so a
+    // Disconnect pressed midway through cannot be undone by work that was
+    // already in the air. See [_flow].
+    final flow = _flow;
+    void set(BenchState next) {
+      if (flow != _flow) return;
+      _set(next);
+    }
+
     try {
       await _scanSub?.cancel();
       _scanSub = null;
       _adapter = adapter;
-      _set(Connecting(adapter));
+      set(Connecting(adapter));
 
-      await _transport.connect(adapter.id);
+      await _link.connect(adapter.id);
       _watchLink();
 
-      final session = ElmSession(_transport)..onTrace = _log;
+      final session = ElmSession(_link)..onTrace = _log;
       _session = session;
       _programmer = AdapterProgrammer(session);
 
-      _set(Identifying(adapter, 'Configuring adapter'));
+      set(Identifying(adapter, 'Configuring adapter'));
       await session.initialize();
 
-      _set(Identifying(adapter, 'Identifying model'));
+      set(Identifying(adapter, 'Identifying model'));
       final fingerprint =
-          await fingerprintAdapter(gatt: _transport.gatt, session: session);
+          await fingerprintAdapter(gatt: _link.gatt, session: session);
       _fingerprint = fingerprint;
       for (final s in fingerprint.signals) {
         _log('fingerprint: $s');
@@ -170,13 +284,13 @@ class BenchController extends ChangeNotifier {
       // Rule 1. Nothing below this point writes, but the decision belongs here
       // where it is unmissable rather than buried in the write path.
       if (fingerprint.model == null) {
-        _set(NotProgrammable(adapter, fingerprint,
+        set(NotProgrammable(adapter, fingerprint,
             'This adapter does not expose the MillerOBD vendor service. It is '
             'not one of ours.'));
         return;
       }
       if (!fingerprint.model!.isProgrammable) {
-        _set(NotProgrammable(adapter, fingerprint,
+        set(NotProgrammable(adapter, fingerprint,
             'This is a ${fingerprint.model!.label}. It has no writable '
             'storage — PP writes are rejected and ATSD writes are ignored — so '
             'it cannot carry a serial. Its entitlement is keyed on its '
@@ -184,7 +298,7 @@ class BenchController extends ChangeNotifier {
         return;
       }
 
-      _set(Identifying(adapter, 'Reading identity'));
+      set(Identifying(adapter, 'Reading identity'));
       final read = await _programmer!.readIdentity();
 
       // Checked before the identity is interpreted: if the slots are enabled,
@@ -192,35 +306,36 @@ class BenchController extends ChangeNotifier {
       if (read.needsRepair) {
         _log('WARNING: identity slots are ENABLED: '
             '${read.enabledIdentitySlots.join(", ")}');
-        _set(NeedsRepair(adapter, fingerprint, read));
+        set(NeedsRepair(adapter, fingerprint, read));
         return;
       }
 
       if (read.identity.partial) {
         _log('identity is partially written — serial bytes '
             '${read.identity.displaySerial}, some slots still FF');
-        _set(PartiallyProgrammed(adapter, fingerprint, read));
+        set(PartiallyProgrammed(adapter, fingerprint, read));
         return;
       }
 
       if (!read.identity.programmed) {
         _log('identity: blank (all slots FF)');
-        _set(ReadyToProgram(adapter, fingerprint));
+        set(ReadyToProgram(adapter, fingerprint));
         return;
       }
 
       // Carries a serial. Ask the database whether it is one of ours.
       _log('identity: ${read.identity.displaySerial} '
           'v${read.identity.version} tag ${read.identity.tagHex}');
-      _set(Identifying(adapter, 'Checking the database'));
+      set(Identifying(adapter, 'Checking the database'));
       final record = await _client.lookup(read.identity.serial);
       if (record != null) {
-        _set(AlreadyProgrammed(adapter, fingerprint, read, record));
+        set(AlreadyProgrammed(adapter, fingerprint, read, record));
       } else {
-        _set(UnknownSerial(adapter, fingerprint, read));
+        set(UnknownSerial(adapter, fingerprint, read));
       }
     } on Object catch (e) {
-      _fail('Could not identify the adapter', '$e', canRetry: true);
+      _fail('Could not identify the adapter', '$e',
+          canRetry: true, flow: flow);
     } finally {
       _busy = false;
     }
@@ -242,12 +357,20 @@ class BenchController extends ChangeNotifier {
     if (adapter == null || programmer == null || fingerprint == null) return;
     if (_busy) return;
     _busy = true;
+    // Stamp every state write below with the unit this call belongs to, so a
+    // Disconnect pressed midway through cannot be undone by work that was
+    // already in the air. See [_flow].
+    final flow = _flow;
+    void set(BenchState next) {
+      if (flow != _flow) return;
+      _set(next);
+    }
 
     Allocation? allocation;
     try {
       // Rule 2: the serial comes from the server, and it comes BEFORE any
       // write. An offline bench stops here, having touched nothing.
-      _set(Allocating(adapter));
+      set(Allocating(adapter));
       allocation = await _client.allocate(
         model: fingerprint.model!,
         bleAddress: adapter.id,
@@ -257,16 +380,16 @@ class BenchController extends ChangeNotifier {
           '(tag ${allocation.tagHex})');
 
       if (wipeFirst) {
-        _set(Writing(adapter, allocation, 'Erasing the existing identity'));
+        set(Writing(adapter, allocation, 'Erasing the existing identity'));
         final erased = await programmer.eraseIdentity();
         if (!erased.ok) {
           _failAllocated(allocation, adapter, 'Erase did not complete',
-              erased.describeMismatches());
+              erased.describeMismatches(), flow: flow);
           return;
         }
       }
 
-      _set(Writing(adapter, allocation, 'Writing identity'));
+      set(Writing(adapter, allocation, 'Writing identity'));
       // Rule 3: writeIdentity reads every byte back and compares against what
       // we intended. Its `ok` is the only success signal this flow accepts.
       final result = await programmer.writeIdentity(
@@ -283,12 +406,13 @@ class BenchController extends ChangeNotifier {
               'If this adapter is a Go this is expected — it has no writable '
               'storage. Otherwise the write was interrupted; the slots are '
               'rewritable, so retrying is safe.',
+          flow: flow,
         );
         return;
       }
       _log('read-back matched on all ${kAllSlots.length} slots + user byte');
 
-      _set(Writing(adapter, allocation, 'Checking adapter health'));
+      set(Writing(adapter, allocation, 'Checking adapter health'));
       final health = await programmer.healthCheck();
       _log('health: ATI="${health.version}" ATDPN="${health.protocol}" '
           'ATRV="${health.voltage}"');
@@ -299,17 +423,18 @@ class BenchController extends ChangeNotifier {
           'The adapter stopped answering normally after programming',
           'ATI="${health.version}" ATDPN="${health.protocol}". A unit that '
               'fails this must not ship even though its identity is valid.',
+          flow: flow,
         );
         return;
       }
 
       // Rule 4. Everything above passed, so the unit is real; from here on the
       // only thing that can go wrong is the network, and that is recoverable.
-      _set(Writing(adapter, allocation, 'Recording'));
+      set(Writing(adapter, allocation, 'Recording'));
       final recorded = await _record(allocation, adapter, health);
 
       sessionCount++;
-      _set(Success(
+      set(Success(
         adapter: adapter,
         allocation: allocation,
         health: health,
@@ -322,15 +447,17 @@ class BenchController extends ChangeNotifier {
       if (allocation == null) {
         _fail(e.offline ? 'The bench is offline' : 'The server refused',
             '${e.message}\n\nNothing was written to the adapter.',
-            canRetry: true);
+            canRetry: true, flow: flow);
       } else {
-        _failAllocated(allocation, adapter, 'The server refused', e.message);
+        _failAllocated(allocation, adapter, 'The server refused', e.message,
+            flow: flow);
       }
     } on Object catch (e) {
       if (allocation == null) {
-        _fail('Programming failed', '$e', canRetry: true);
+        _fail('Programming failed', '$e', canRetry: true, flow: flow);
       } else {
-        _failAllocated(allocation, adapter, 'Programming failed', '$e');
+        _failAllocated(allocation, adapter, 'Programming failed', '$e',
+            flow: flow);
       }
     } finally {
       _busy = false;
@@ -449,7 +576,12 @@ class BenchController extends ChangeNotifier {
   // Failure and teardown
   // ---------------------------------------------------------------------
 
-  void _fail(String message, String detail, {required bool canRetry}) {
+  /// [flow] is the unit the caller was working on — see [_flow]. Omitted only
+  /// by the link watcher, whose events are about the present moment rather
+  /// than about a unit.
+  void _fail(String message, String detail,
+      {required bool canRetry, int? flow}) {
+    if (flow != null && flow != _flow) return;
     _log('FAILED: $message — $detail');
     _set(Failed(
       message: message,
@@ -463,8 +595,10 @@ class BenchController extends ChangeNotifier {
     Allocation allocation,
     DiscoveredAdapter adapter,
     String message,
-    String detail,
-  ) {
+    String detail, {
+    int? flow,
+  }) {
+    if (flow != null && flow != _flow) return;
     _log('FAILED at ${allocation.displaySerial}: $message — $detail');
     _set(Failed(
       message: message,
@@ -550,7 +684,20 @@ class BenchController extends ChangeNotifier {
   /// control on the success screen, and the manual escape everywhere else.
   Future<void> nextDevice() => startScan();
 
-  Future<void> _teardownLink() async {
+  /// Drop everything built on top of the transport.
+  ///
+  /// Deliberately does NOT call `transport.disconnect()`. That used to be here
+  /// and it read like the careful version, which is the opposite of what it
+  /// was: [_retire] disposes the instance, and dispose already awaits its own
+  /// disconnect before it stops the radio. The soft call added nothing, and it
+  /// was the one step in this teardown that could block — a call into the very
+  /// native queue whose wedging is the reason the button was pressed.
+  ///
+  /// Everything left here is pure Dart: cancelling subscriptions and closing a
+  /// session that owns nothing but a stream listener.
+  Future<void> _releaseLocalState() async {
+    await _scanSub?.cancel();
+    _scanSub = null;
     await _linkSub?.cancel();
     _linkSub = null;
     await _session?.close();
@@ -558,11 +705,24 @@ class BenchController extends ChangeNotifier {
     _programmer = null;
     _adapter = null;
     _fingerprint = null;
-    try {
-      await _transport.disconnect();
-    } catch (_) {
-      // Already gone.
-    }
+  }
+
+  /// Send a transport to its death without waiting for it.
+  ///
+  /// Fire-and-forget on purpose — see rule 2 on [startScan]. The instance
+  /// marks itself dead synchronously inside dispose(), which is the part that
+  /// matters for correctness; everything after that is cleanup that may take
+  /// as long as it likes, or never finish, without anyone depending on it.
+  ///
+  /// Failures are logged rather than thrown. A transport being torn down
+  /// because something already went wrong is entitled to fail on the way out,
+  /// and there is no caller left to tell.
+  void _retire(BleTransport outgoing) {
+    unawaited(
+      outgoing.dispose().catchError((Object e) {
+        _log('transport: teardown failed on the way out — $e');
+      }),
+    );
   }
 
   /// Notice a link that drops underneath us.
@@ -573,7 +733,7 @@ class BenchController extends ChangeNotifier {
   /// would be the first thing seen — or, worse with a different guard, skipped.
   void _watchLink() {
     _linkSub?.cancel();
-    _linkSub = _transport.connectionState
+    _linkSub = _link.connectionState
         .skipWhile((connected) => !connected)
         .listen((connected) {
       if (connected) return;
@@ -593,7 +753,7 @@ class BenchController extends ChangeNotifier {
     _scanSub?.cancel();
     _linkSub?.cancel();
     _session?.close();
-    _transport.dispose();
+    _transport?.dispose();
     _client.close();
     super.dispose();
   }
